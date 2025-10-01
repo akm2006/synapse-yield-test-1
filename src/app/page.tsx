@@ -4,9 +4,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { publicClient, walletClient } from '@/lib/client';
 import { CONTRACTS } from '@/lib/contracts';
-import { erc20Abi } from '@/lib/abis';
+import { erc20Abi, permit2Abi } from '@/lib/abis';
 import type { Address } from 'viem';
-import { formatUnits } from 'viem';
+import { formatUnits, maxUint256 } from 'viem';
 
 export default function Home() {
   const [balances, setBalances] = useState({ native: '0', kintsu: '0', magma: '0' });
@@ -14,6 +14,14 @@ export default function Home() {
   const [logs, setLogs] = useState<string[]>([]);
   const unwatchRef = useRef<null | (() => void)>(null);
   const pollRef = useRef<null | number>(null);
+
+  // NEW: manual amount state (defaults preserved from previous hard-coded buttons)
+  const [amt, setAmt] = useState({
+    magmaStake: '0.01',
+    magmaUnstake: '0.01',
+    kintsuStake: '0.02',
+    kintsuUnstake: '0.01',
+  });
 
   function log(msg: string) {
     setLogs((prev) => [...prev, msg]);
@@ -129,14 +137,40 @@ export default function Home() {
     await fetchBalances();
   }
 
+  // Unstake Kintsu (existing, unchanged)
   async function unstakeKintsu(amount: string) {
     try {
       const amountInWei = BigInt(Math.floor(+amount * 1e18)).toString();
-      const minOutWei = (BigInt(amountInWei) * 99n) / 100n + ''; // 1% slippage buffer for prototype
+      const minOutWei = ((BigInt(amountInWei) * 99n) / 100n).toString();
       const fee = 2500;
       const recipient = walletClient.account.address;
 
-      log(`[ACTION] Kintsu Instant Unstake via Pancake (server): ${amount}`);
+      // 1) Create an operation id and open SSE stream
+      const opId =
+        (crypto as any)?.randomUUID?.() ??
+        Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+      log(`[ACTION] Streaming approval logs for opId=${opId}`);
+
+      const es = new EventSource(`/api/logs/stream?id=${opId}`);
+      es.addEventListener('log', (ev: MessageEvent) => {
+        try {
+          const { msg } = JSON.parse(ev.data);
+          log(`[APPROVAL] ${msg}`);
+        } catch {
+          log('[APPROVAL] <malformed log event>');
+        }
+      });
+      es.addEventListener('done', () => {
+        log('[APPROVAL] stream closed');
+        es.close();
+      });
+      es.onerror = () => {
+        log('[APPROVAL] stream error');
+        es.close();
+      };
+
+      // 2) Call the server route with opId included
       const json = await postJSON('/api/tx/kintsu/unstake', {
         amountIn: amountInWei,
         minOut: minOutWei,
@@ -144,21 +178,134 @@ export default function Home() {
         recipient,
         unwrap: true,
         deadlineSec: 1800,
+        opId,
       });
-      if (!json.ok) return log(`[ERROR] Unstake Kintsu: ${json.error}`);
-      log(`[TX] UR swap hash: ${json.swap.hash}`);
-      log(
-        `[TX] UR swap confirmed at block: ${json.swap.receipt.blockNumber}`
-      );
-      if (json.unwrap) {
-        log(`[TX] WMON unwrap hash: ${json.unwrap.hash}`);
+
+      if (!json.ok) {
+        log(`[ERROR] Unstake Kintsu: ${json.error}`);
+        return;
+      }
+
+      // 3) Append any summary approval events returned at the end
+      if (json.approvals?.smon?.erc20) {
         log(
-          `[TX] WMON unwrap confirmed at block: ${json.unwrap.receipt.blockNumber}`
+          `[APPROVAL] ERC20: ${json.approvals.smon.erc20.message}` +
+            (json.approvals.smon.erc20.txHash ? ` tx=${json.approvals.smon.erc20.txHash}` : '')
         );
       }
+      if (json.approvals?.smon?.permit2) {
+        log(
+          `[APPROVAL] Permit2: ${json.approvals.smon.permit2.message}` +
+            (json.approvals.smon.permit2.txHash ? ` tx=${json.approvals.smon.permit2.txHash}` : '')
+        );
+      }
+
+      log(`[TX] UR swap hash: ${json.swap.hash}`);
+      log(`[TX] UR swap confirmed at block: ${json.swap.receipt.blockNumber}`);
+
+      if (json.unwrap) {
+        log(`[TX] WMON unwrap hash: ${json.unwrap.hash}`);
+        log(`[TX] WMON unwrap confirmed at block: ${json.unwrap.receipt.blockNumber}`);
+      }
+
       await fetchBalances();
     } catch (err: any) {
       log(`[ERROR] Unstake Kintsu flow: ${err.message || err}`);
+    }
+  }
+
+  // NEW: helpers for sMON approvals
+  function toWeiStr(v: string) {
+    try {
+      return BigInt(Math.floor(+v * 1e18)).toString();
+    } catch {
+      return '0';
+    }
+  }
+
+  // Check current approvals for sMON (ERC20->Permit2 and Permit2->UniversalRouter)
+  async function checkSmonApprovals(amount: string) {
+    try {
+      const owner: Address = walletClient.account.address;
+      const token = CONTRACTS.KINTSU as Address;
+      const PERMIT2 = CONTRACTS.PERMIT2 as Address;
+      const ROUTER = CONTRACTS.PANCAKESWAP as Address;
+
+      const needed = BigInt(toWeiStr(amount));
+
+      const erc20Allowance = (await publicClient.readContract({
+        address: token,
+        abi: erc20Abi,
+        functionName: 'allowance',
+        args: [owner, PERMIT2],
+      })) as bigint;
+
+      let pAmount = 0n;
+      let pExp = 0;
+      try {
+        const res = (await publicClient.readContract({
+          address: PERMIT2,
+          abi: permit2Abi,
+          functionName: 'allowance',
+          args: [owner, token, ROUTER],
+        })) as [bigint, number, number]; // amount(uint160), expiration(uint48), nonce(uint48)
+        pAmount = res[0];
+        pExp = res[1];
+      } catch {
+        // treat as zero
+      }
+
+      const now = Math.floor(Date.now() / 1000);
+      const okErc20 = erc20Allowance >= needed;
+      const okPermit2 = pAmount >= needed && (pExp === 0 || pExp > now);
+
+      log(
+        `[CHECK] ERC20 allowance to Permit2: current=${erc20Allowance.toString()} needed=${needed.toString()} ok=${okErc20}`
+      );
+      log(
+        `[CHECK] Permit2 allowance to Router: current=${pAmount.toString()} exp=${pExp} ok=${okPermit2}`
+      );
+    } catch (e: any) {
+      log(`[ERROR] checkSmonApprovals: ${e?.message || e}`);
+    }
+  }
+
+  // Submit approvals for sMON (ERC20 approve to Permit2, then Permit2.approve to Router)
+  async function approveSmon() {
+    try {
+      const owner: Address = walletClient.account.address;
+      const token = CONTRACTS.KINTSU as Address;
+      const PERMIT2 = CONTRACTS.PERMIT2 as Address;
+      const ROUTER = CONTRACTS.PANCAKESWAP as Address;
+
+      // 1) ERC20 approve(token -> Permit2) with max
+      log('[ACTION] Approving sMON to Permit2 (ERC20 max)…');
+      const tx1 = await walletClient.writeContract({
+        address: token,
+        abi: erc20Abi,
+        functionName: 'approve',
+        args: [PERMIT2, maxUint256],
+        account: owner,
+      });
+      log(`[TX] ERC20 approve tx=${tx1}`);
+
+      // 2) Permit2.approve(token -> Router) with uint160 max and uint48 expiration (number)
+      const MAX_UINT160 = (1n << 160n) - 1n; // type(uint160).max
+      const expiration: number = Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60;
+
+      log('[ACTION] Approving Permit2 → Router (uint160 max, 1y)…');
+      const tx2 = await walletClient.writeContract({
+        address: PERMIT2,
+        abi: permit2Abi,
+        functionName: 'approve',
+        args: [token, ROUTER, MAX_UINT160, expiration],
+        account: owner,
+      });
+      log(`[TX] Permit2 approve tx=${tx2}`);
+
+      log('[INFO] sMON approvals submitted (wait for confirmations in wallet/Explorer).');
+    } catch (e: any) {
+      log(`[ERROR] approveSmon: ${e?.message || e}`);
     }
   }
 
@@ -258,41 +405,102 @@ export default function Home() {
         )}
       </section>
 
-      <section className="mb-6 space-y-2">
+      {/* Actions with manual inputs (minimal UI changes) */}
+      <section className="mb-6 space-y-3">
         <h2 className="text-xl font-semibold mb-2">Actions:</h2>
-        <button
-          className="w-full px-4 py-3 bg-blue-600 text-white rounded shadow"
-          onClick={() => stakeMagma('0.01')}
-          disabled={loading}
-        >
-          Stake 0.01 MON → gMON
-        </button>
-        <button
-          className="w-full px-4 py-3 bg-blue-600 text-white rounded shadow"
-          onClick={() => unstakeMagma('0.01')}
-          disabled={loading}
-        >
-          Unstake 0.01 gMON → MON
-        </button>
-        <button
-          className="w-full px-4 py-3 bg-green-600 text-white rounded shadow"
-          onClick={() => stakeKintsu('0.02')}
-          disabled={loading}
-        >
-          Stake 0.02 MON → sMON
-        </button>
-        <button
-          className="w-full px-4 py-3 bg-green-600 text-white rounded shadow"
-          onClick={() => unstakeKintsu('0.01')}
-          disabled={loading}
-        >
-          Instant Unstake 0.01 sMON → MON
-        </button>
+
+        <div className="space-y-2">
+          <label className="block text-sm">Stake MON → gMON (amount)</label>
+          <input
+            className="w-full px-3 py-2 border rounded bg-gray-800 text-white"
+            value={amt.magmaStake}
+            onChange={(e) => setAmt((s) => ({ ...s, magmaStake: e.target.value }))}
+          />
+          <button
+            className="w-full px-4 py-3 bg-blue-600 text-white rounded shadow"
+            onClick={() => stakeMagma(amt.magmaStake)}
+            disabled={loading}
+          >
+            Stake
+          </button>
+        </div>
+
+        <div className="space-y-2">
+          <label className="block text-sm">Unstake gMON → MON (amount)</label>
+          <input
+            className="w-full px-3 py-2 border rounded bg-gray-800 text-white"
+            value={amt.magmaUnstake}
+            onChange={(e) => setAmt((s) => ({ ...s, magmaUnstake: e.target.value }))}
+          />
+          <button
+            className="w-full px-4 py-3 bg-blue-600 text-white rounded shadow"
+            onClick={() => unstakeMagma(amt.magmaUnstake)}
+            disabled={loading}
+          >
+            Unstake
+          </button>
+        </div>
+
+        <div className="space-y-2">
+          <label className="block text-sm">Stake MON → sMON (amount)</label>
+          <input
+            className="w-full px-3 py-2 border rounded bg-gray-800 text-white"
+            value={amt.kintsuStake}
+            onChange={(e) => setAmt((s) => ({ ...s, kintsuStake: e.target.value }))}
+          />
+          <button
+            className="w-full px-4 py-3 bg-green-600 text-white rounded shadow"
+            onClick={() => stakeKintsu(amt.kintsuStake)}
+            disabled={loading}
+          >
+            Stake
+          </button>
+        </div>
+
+        <div className="space-y-2">
+          <label className="block text-sm">Instant Unstake sMON → MON (amount)</label>
+          <input
+            className="w-full px-3 py-2 border rounded bg-gray-800 text-white"
+            value={amt.kintsuUnstake}
+            onChange={(e) => setAmt((s) => ({ ...s, kintsuUnstake: e.target.value }))}
+          />
+          <button
+            className="w-full px-4 py-3 bg-green-600 text-white rounded shadow"
+            onClick={() => unstakeKintsu(amt.kintsuUnstake)}
+            disabled={loading}
+          >
+            Instant Unstake
+          </button>
+        </div>
+      </section>
+
+      {/* Approval utilities for sMON */}
+      <section className="mb-6 space-y-2">
+        <h2 className="text-xl font-semibold mb-2">sMON Approvals</h2>
+        <div className="flex gap-2">
+          <button
+            className="flex-1 px-4 py-3 bg-purple-700 text-white rounded shadow"
+            onClick={() => checkSmonApprovals(amt.kintsuUnstake)}
+            disabled={loading}
+          >
+            Check sMON Approvals
+          </button>
+          <button
+            className="flex-1 px-4 py-3 bg-purple-700 text-white rounded shadow"
+            onClick={approveSmon}
+            disabled={loading}
+          >
+            Approve sMON (Permit2+UR)
+          </button>
+        </div>
+        <p className="text-xs text-gray-300">
+          Checks ERC20 allowance to Permit2 and Permit2 allowance to Universal Router; approval uses uint160 amount and uint48 expiration per Permit2. 
+        </p>
       </section>
 
       <section className="mb-6">
         <button
-          className="w-full px-6 py-4 bg-purple-700 text-white rounded-lg font-semibold text-lg"
+          className="w-full px-6 py-4 bg-indigo-700 text-white rounded-lg font-semibold text-lg"
           onClick={rebalance}
           disabled={loading}
         >
